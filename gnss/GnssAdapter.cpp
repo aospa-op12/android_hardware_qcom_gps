@@ -26,43 +26,11 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  */
-
 /*
-Changes from Qualcomm Innovation Center are provided under the following license:
-
-Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted (subject to the limitations in the
-disclaimer below) provided that the following conditions are met:
-
-    * Redistributions of source code must retain the above copyright
-      notice, this list of conditions and the following disclaimer.
-
-    * Redistributions in binary form must reproduce the above
-      copyright notice, this list of conditions and the following
-      disclaimer in the documentation and/or other materials provided
-      with the distribution.
-
-    * Neither the name of Qualcomm Innovation Center, Inc. nor the names of its
-      contributors may be used to endorse or promote products derived
-      from this software without specific prior written permission.
-
-NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE
-GRANTED BY THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT
-HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
-WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
-MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
-IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
-ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
-GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
-IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
-OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
-IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
-
+ * Changes from Qualcomm Technologies, Inc. are provided under the following license:
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
+ */
 #define LOG_NDEBUG 0
 #define LOG_TAG "LocSvc_GnssAdapter"
 
@@ -217,6 +185,7 @@ GnssAdapter::GnssAdapter() :
     mPositionElapsedRealTimeCal(30000000),
     mAddressRequestCb(nullptr),
     mHmacConfig(HMAC_CONFIG_UNKNOWN),
+    mPrecisePosConfigWaiter(),
     mGnssCapabNotification{},
     mAppHash(""),
     m3GppSourceMask(QDGNSS_3GPP_SOURCE_UNKNOWN),
@@ -266,7 +235,6 @@ GnssAdapter::GnssAdapter() :
     initCDFWServiceCommand();
     initEngHubProxyCommand();
     initLocGlinkCommand();
-    testLaunchQppeBringUp();
     mXtraObserver.init();
     // at last step, let us inform adapater base that we are done
     // with initialization, e.g.: ready to process handleEngineUpEvent
@@ -504,30 +472,23 @@ void GnssAdapter::fillElapsedRealTime(const GpsLocationExtended& locationExtende
                 out.location.elapsedgPTPTimeUnc = 0;
             }
         }
-#ifndef FEATURE_AUTOMOTIVE
-        else if ((out.location.timestamp > 0) &&
-                 (locationExtended.gpsTime.gpsWeek != UNKNOWN_GPS_WEEK_NUM)) {
-            int64_t locationTimeNanos = (int64_t)out.location.timestamp * 1000000;
-            bool isCurDataTimeTrustable =
-                    (out.location.timestamp % mLocPositionMode.min_interval == 0);
-            int64_t elapsedRealTime = mPositionElapsedRealTimeCal.getElapsedRealtimeEstimateNanos(
-                    locationTimeNanos, isCurDataTimeTrustable,
-                    (int64_t)mLocPositionMode.min_interval * 1000000);
-
-            if (elapsedRealTime != -1) {
-                out.location.flags |= LOCATION_HAS_ELAPSED_REAL_TIME_BIT;
-                out.location.elapsedRealTime = elapsedRealTime;
-                out.location.elapsedRealTimeUnc =
-                        mPositionElapsedRealTimeCal.getElapsedRealtimeUncNanos();
-            }
-        }
-#endif //FEATURE_AUTOMOTIVE
     }
+
 #ifndef FEATURE_AUTOMOTIVE
+    bool needToUseCurrentBootTime = false;
+    uint64_t currentBootTimeNs = getBootTimeMilliSec() * 1000000;
     if (!(out.location.flags & LOCATION_HAS_ELAPSED_REAL_TIME_BIT)) {
-        out.location.elapsedRealTime = getBootTimeMilliSec() * 1000000;
-        out.location.elapsedRealTimeUnc = mPositionElapsedRealTimeCal.getElapsedRealtimeUncNanos();
-        out.location.flags |= LOCATION_HAS_ELAPSED_REAL_TIME_BIT;
+       needToUseCurrentBootTime = true;
+       LOC_LOGw("can not calculate elapsed real time, set to current time");
+    } else if (out.location.elapsedRealTime > currentBootTimeNs) {
+       needToUseCurrentBootTime = true;
+       LOC_LOGw("elapsed real time is %" PRIu64 " nsec in future, set to current time",
+                out.location.elapsedRealTime - currentBootTimeNs);
+    }
+    if (needToUseCurrentBootTime) {
+       out.location.elapsedRealTime = currentBootTimeNs;
+       out.location.elapsedRealTimeUnc = mPositionElapsedRealTimeCal.getElapsedRealtimeUncNanos();
+       out.location.flags |= LOCATION_HAS_ELAPSED_REAL_TIME_BIT;
     }
 #endif //FEATURE_AUTOMOTIVE
 }
@@ -2812,9 +2773,10 @@ GnssAdapter::setEsStatusCallbackCommand(std::function<void(bool)> esStatusCb)
 }
 
 void
-GnssAdapter::setTribandState() {
+GnssAdapter::setTribandState(bool sessionStartInProgress) {
     bool enabled = false;
-    if (isInSession() && mEngServiceInfo.ppeIntEnabled && isQppeEnabled()) {
+    if ((isInSession() || sessionStartInProgress) &&
+            mEngServiceInfo.ppeIntEnabled && isQppeEnabled()) {
         enabled = true;
     }
     LOC_LOGd("enabled:%d", enabled);
@@ -3160,6 +3122,7 @@ GnssAdapter::handleEngineUpEvent()
             mAdapter.broadcastCapabilities(mAdapter.getCapabilities());
             // must be called only after capabilities are known
             mAdapter.setConfig();
+            mAdapter.notifyPreciseLocation();
             mAdapter.setTribandState();
             mAdapter.gnssSvConfigUpdate();
             mAdapter.updateSystemPowerState(mAdapter.getSystemPowerState());
@@ -3374,26 +3337,6 @@ GnssAdapter::eraseTrackingSession(LocationAPI* client, uint32_t sessionId)
     }
 }
 
-void GnssAdapter::testLaunchQppeBringUp() {
-    std::thread testLaunchThead([&](){
-        int retryAttempts = 60;
-        mQppeResp = false;
-        getSystemStatus()->eventPreciseLocation(true);
-        getSystemStatus()->eventSetTracking(true, true);
-        while (retryAttempts >= 0 && !mQppeResp) {
-            LOC_LOGd("testLaunchQppeBringUp, retry %d", (60 - retryAttempts));
-            sleep(1);
-            retryAttempts--;
-        }
-        if (!(mPpFeatureStatusMask & DLP_FEATURE_STATUS_LIBRARY_PRESENT)) {
-            LOC_LOGd("timeout, no response from Qppe process.");
-            getSystemStatus()->eventPreciseLocation(false);
-        }
-        getSystemStatus()->eventSetTracking(isInSession(), false);
-    });
-    testLaunchThead.detach();
-}
-
 bool GnssAdapter::setLocPositionMode(const LocPosMode& mode) {
     if (!mLocPositionMode.equals(mode)) {
         mLocPositionMode = mode;
@@ -3463,6 +3406,9 @@ GnssAdapter::startTrackingCommand(LocationAPI* client, const TrackingOptions& op
              client, sessionId, options.minInterval, options.minDistance, options.mode,
              options.powerMode, options.tbm);
 
+    // Wait for precise positioning configuration to complete before proceeding
+    mPrecisePosConfigWaiter.wait(2000);
+
     struct MsgStartTracking : public LocMsg {
         GnssAdapter& mAdapter;
         LocApiBase& mApi;
@@ -3526,11 +3472,12 @@ GnssAdapter::startTrackingCommand(LocationAPI* client, const TrackingOptions& op
                                 mOptions.tbm, TRACKING_TBM_THRESHOLD_MILLIS);
                         mOptions.powerMode = GNSS_POWER_MODE_M2;
                     }
+                    // Triband state request needs to be sent before session start request
+                    mAdapter.setTribandState(true);
                     // Api doesn't support multiple clients for time based tracking, so mutiplex
                     bool reportToClientWithNoWait =
                             mAdapter.startTimeBasedTrackingMultiplex(mClient, mSessionId, mOptions);
                     mAdapter.saveTrackingSession(mClient, mSessionId, mOptions);
-                    mAdapter.setTribandState();
 
                     if (reportToClientWithNoWait) {
                         mAdapter.reportResponse(mClient, LOCATION_ERROR_SUCCESS, mSessionId);
@@ -6008,46 +5955,24 @@ void GnssAdapter::handleQesdkQwesStatusFromEHub(
             mAdapter(adapter),
             mFeatureMap(featureMap) {}
         inline virtual void proc() const {
-            LOC_LOGD("MsgReportQwesStatusFromEHub: before mPpFeatureStatusMask: 0x%x",
-                     mAdapter.mPpFeatureStatusMask);
-            auto ppeInFeatureMap = mFeatureMap.find(LOCATION_QWES_FEATURE_TYPE_PPE);
+            LOC_LOGd("before mPpFeatureStatusMask: 0x%x", mAdapter.mPpFeatureStatusMask);
             auto dlpQesdkInFeatureMap = mFeatureMap.find(LOCATION_QWES_FEATURE_TYPE_DLP_QESDK);
-            auto qfeInFeatureMap = mFeatureMap.find(LOCATION_QWES_FEATURE_TYPE_QDR3);
             auto cdParserInFeatureMap = mFeatureMap.find(LOCATION_FEATURE_TYPE_CORR_DATA_PARSER);
 
             //QESDK feature status call back handling logic:
-            //1, If LOCATION_QWES_FEATURE_TYPE_PPE is presented in feature map,
-            //   It means Qwes status callback is triggered by Engine Servive try
-            //   to register to Engine Hub, set DLP_FEATURE_STATUS_QPPE_LIBRARY_PRESENT
-            //   bit, and set DLP_FEATURE_ENABLED_BY_DEFAULT bit according to
-            //   PPE feature status;
-            //2, If LOCATION_QWES_FEATURE_TYPE_QDR3 is presented in feature map,
-            //   It means Qwes status callback is triggered by Engine Servive try
-            //   to register to Engine Hub, set DLP_FEATURE_STATUS_QFE_LIBRARY_PRESENT
-            //   bit, and set DLP_FEATURE_ENABLED_BY_DEFAULT bit according to
-            //   PPE feature status;
-            //3, If LOCATION_QWES_FEATURE_TYPE_DLP_QESDK is presented in feature map,
+            //1, DLP_FEATURE_ENABLED_BY_DEFAULT bit is set in reportQwesCapabilities
+            //   according to PPE and QFE feature status during GNSS HAL process
+            //   boot up;
+            //   DLP_FEATURE_STATUS_QPPE_LIBRARY_PRESENT bit is set in initEngHubProxy
+            //   when QPPE process is enabled in izat.conf.
+            //   DLP_FEATURE_STATUS_QFE_LIBRARY_PRESENT bit is set in initEngHubProxy
+            //   when QEF process is enabled in izat.conf.
+            //2, If LOCATION_QWES_FEATURE_TYPE_DLP_QESDK is presented in feature map,
             //   It means Qwes status callback is triggered when Engine hub recieves
             //   configPreciseLocation command from GnssAdapter, and already checked
             //   QESDK feature status via QWES call checkInstalledLicense, set
             //   DLP_FEATURE_ENABLED_BY_QESDK bit according to QESDK feature status.
-            if (ppeInFeatureMap != mFeatureMap.end() || qfeInFeatureMap != mFeatureMap.end()) {
-                if (ppeInFeatureMap != mFeatureMap.end()) {
-                    mAdapter.mPpFeatureStatusMask |= DLP_FEATURE_STATUS_QPPE_LIBRARY_PRESENT;
-                }
-                if (qfeInFeatureMap != mFeatureMap.end()) {
-                    mAdapter.mPpFeatureStatusMask |= DLP_FEATURE_STATUS_QFE_LIBRARY_PRESENT;
-                }
-                if ((ppeInFeatureMap != mFeatureMap.end() && ppeInFeatureMap->second) ||
-                        (qfeInFeatureMap != mFeatureMap.end() && qfeInFeatureMap->second)) {
-                    mAdapter.mPpFeatureStatusMask |= DLP_FEATURE_ENABLED_BY_DEFAULT;
-                    mAdapter.notifyPreciseLocation();
-                } else {
-                    mAdapter.mPpFeatureStatusMask &= (~DLP_FEATURE_ENABLED_BY_DEFAULT);
-                    mAdapter.notifyPreciseLocation();
-                }
-                mAdapter.mQppeResp = true;
-            } else if (dlpQesdkInFeatureMap != mFeatureMap.end()) {
+            if (dlpQesdkInFeatureMap != mFeatureMap.end()) {
                 if (dlpQesdkInFeatureMap->second) {
                     mAdapter.mPpFeatureStatusMask |= DLP_FEATURE_ENABLED_BY_QESDK;
                     //Send enable precise location data item to loclauncher to inform
@@ -6067,15 +5992,17 @@ void GnssAdapter::handleQesdkQwesStatusFromEHub(
                 // If EngineHubMgr calls this cb, QPPE is loaded as 3GPP SSR2OSR
                 // correction data parser, so set QDGNSS_3GPP_EP_PARSER_AVAIL
                 mAdapter.m3GppSourceMask |= QDGNSS_3GPP_EP_PARSER_AVAIL;
-                LOC_LOGD("MsgReportQwesStatusFromEHub, set QDGNSS_3GPP_EP_PARSER_AVAIL");
+                LOC_LOGd("set QDGNSS_3GPP_EP_PARSER_AVAIL");
                 mAdapter.notifyPreciseLocation();
             }
 
-            LOC_LOGD("MsgReportQwesStatusFromEHub, after mPpFeatureStatusMask: 0x%x",
-                     mAdapter.mPpFeatureStatusMask);
+            LOC_LOGd("after mPpFeatureStatusMask: 0x%x", mAdapter.mPpFeatureStatusMask);
+            mAdapter.mPrecisePosConfigWaiter.signal();
+            mAdapter.mPrecisePosConfigWaiter.deinit();
         }
     };
 
+    LOC_LOGv("Qwes status from EHub");
     sendMsg(new MsgReportQwesStatusFromEHub(*this, featureMap));
 }
 
@@ -6101,6 +6028,19 @@ bool GnssAdapter::reportQwesCapabilities(
             }
             LOC_LOGI("ReportQwesFeatureStatus after caps %" PRIx64 " ",
                      mAdapter.getCapabilities());
+            //Set Dlp feature bit
+            auto ppeInFeatureMap = mFeatureMap.find(LOCATION_QWES_FEATURE_TYPE_PPE);
+            auto qfeInFeatureMap = mFeatureMap.find(LOCATION_QWES_FEATURE_TYPE_QDR3);
+            if (ppeInFeatureMap != mFeatureMap.end() || qfeInFeatureMap != mFeatureMap.end()) {
+                if ((ppeInFeatureMap != mFeatureMap.end() && ppeInFeatureMap->second) ||
+                        (qfeInFeatureMap != mFeatureMap.end() && qfeInFeatureMap->second)) {
+                    mAdapter.mPpFeatureStatusMask |= DLP_FEATURE_ENABLED_BY_DEFAULT;
+                    mAdapter.notifyPreciseLocation();
+                } else {
+                    mAdapter.mPpFeatureStatusMask &= (~DLP_FEATURE_ENABLED_BY_DEFAULT);
+                    mAdapter.notifyPreciseLocation();
+                }
+            }
             mAdapter.broadcastCapabilities(mAdapter.getCapabilities());
         }
     };
@@ -7669,7 +7609,7 @@ bool GnssAdapter::measCorrSetCorrectionsCommand(const GnssMeasurementCorrections
                     break;
                 }
             }
-            char mapDataTestMode[LOC_MAX_PARAM_STRING];
+            char mapDataTestMode[LOC_MAX_PARAM_STRING] = {};
             loc_param_s_type izatMapDataTable[] =
             {
                 { "MAP_DATA_TEST_MODE", &mapDataTestMode, NULL, 's' },
@@ -8142,7 +8082,8 @@ void GnssAdapter::configPrecisePositioningCommand(
             mAppHash(appHash),
             mFeatureId(featureId) {}
         inline virtual void proc() const {
-            LOC_LOGD("ConfigPrecisePositioning: enable: %d, appHash: %s, featureId: %d", mEnable,
+
+            LOC_LOGd("ConfigPrecisePositioning: enable: %d, appHash: %s, featureId: %d", mEnable,
                     mAppHash.c_str(), mFeatureId);
             if (QESDK_FEATURE_ID_EDGNSS == mFeatureId || QESDK_FEATURE_ID_RTK == mFeatureId) {
                 mAdapter.mEngHubProxy->configPrecisePositioning(mFeatureId, mEnable, mAppHash);
@@ -8155,6 +8096,10 @@ void GnssAdapter::configPrecisePositioningCommand(
             }
         }
     };
+
+    // Initialize the waiter to ensure that tracking session waits for this config completion
+    mPrecisePosConfigWaiter.init();
+
     sendMsg(new MsgConfigPrecisePositioning(*this, enable, appHash, featureId));
 }
 
@@ -8194,7 +8139,7 @@ uint32_t GnssAdapter::configMerkleTreeCommand(const char * merkleTreeConfigBuffe
                 mAdapter.reportResponse(LOCATION_ERROR_INVALID_PARAMETER, mSessionId);
                 LOC_LOGE("MsgConfigMerkleTreeParams: Merkle tree config file parse failed");
                 if (treeParam != nullptr) {
-                    delete treeParam;
+                    delete[] treeParam;
                 }
                 return;
             }
@@ -8212,7 +8157,7 @@ uint32_t GnssAdapter::configMerkleTreeCommand(const char * merkleTreeConfigBuffe
                         mAdapter.reportResponse(err, mSessionId);
                         // clean treeParam when response for the last public key reports
                         if (treeParam != nullptr) {
-                            delete treeParam;
+                            delete[] treeParam;
                             treeParam = nullptr;
                         }
                     });
@@ -8220,7 +8165,7 @@ uint32_t GnssAdapter::configMerkleTreeCommand(const char * merkleTreeConfigBuffe
                         LOC_LOGE("MsgConfigMerkleTreeParams: memory alloc failed");
                         mAdapter.reportResponse(LOCATION_ERROR_GENERAL_FAILURE, mSessionId);
                         if (treeParam != nullptr) {
-                            delete treeParam;
+                            delete[] treeParam;
                             treeParam = nullptr;
                         }
                     } else {
@@ -8230,7 +8175,7 @@ uint32_t GnssAdapter::configMerkleTreeCommand(const char * merkleTreeConfigBuffe
                     mAdapter.reportResponse(err, mSessionId);
                     // clean treeParam after response for the only injection reports
                     if (treeParam != nullptr) {
-                        delete treeParam;
+                        delete[] treeParam;
                         treeParam = nullptr;
                     }
                 }
@@ -8239,7 +8184,7 @@ uint32_t GnssAdapter::configMerkleTreeCommand(const char * merkleTreeConfigBuffe
                 LOC_LOGE("MsgConfigMerkleTreeParams: memory alloc failed");
                 mAdapter.reportResponse(LOCATION_ERROR_GENERAL_FAILURE, mSessionId);
                 if (treeParam != nullptr) {
-                    delete treeParam;
+                    delete[] treeParam;
                     treeParam = nullptr;
                 }
             } else {
@@ -8437,15 +8382,21 @@ GnssAdapter::initEngHubProxy() {
                 (processInfoList[i].proc_status == ENABLED)) {
                 pluginDaemonEnabled = true;
                 if (processInfoList[i].args[1]!= nullptr) {
-                    // check if this is DRE-INT engine
+                    // Set DLP_FEATURE_STATUS_QFE_LIBRARY_PRESENT and
+                    // DLP_FEATURE_STATUS_QPPE_LIBRARY_PRESENT bit in
+                    // mPpFeatureStatusMask according to whether QFE and
+                    // QPPE process is enabled.
                     if (strncmp(processInfoList[i].args[1], "DRE-INT", sizeof("DRE-INT")) == 0) {
                         mEngServiceInfo.dreIntEnabled = true;
+                        mPpFeatureStatusMask |= DLP_FEATURE_STATUS_QFE_LIBRARY_PRESENT;
                     } else if (strncmp(processInfoList[i].args[1], "PPE", sizeof("PPE")) == 0) {
                         mEngServiceInfo.ppeEnabled = true;
+                        mPpFeatureStatusMask |= DLP_FEATURE_STATUS_QPPE_LIBRARY_PRESENT;
                     } else if (strncmp(processInfoList[i].args[1], "PPE-INT", sizeof("PPE-INT"))
                                == 0) {
                         mEngServiceInfo.ppeIntEnabled = true;
                         mEngServiceInfo.ppeEnabled = true;
+                        mPpFeatureStatusMask |= DLP_FEATURE_STATUS_QPPE_LIBRARY_PRESENT;
                     }
                 }
             }
@@ -8838,10 +8789,6 @@ void GnssAdapter::handleEnablePPENtrip(const GnssNtripConnectionParams& params,
         bool enableRTKEngine) {
     uint32_t nmeaUpdateInterval = params.nmeaUpdateInterval ? params.nmeaUpdateInterval :
             DGNSS_RANGE_UPDATE_TIME_10MIN_IN_SEC;
-    LOC_LOGd("%d %s %d %s %s %s %d %d mSendNmeaConsent %d",
-             params.useSSL, params.hostNameOrIp.data(), params.port,
-             params.mountPoint.data(), params.username.data(), params.password.data(),
-             params.requiresNmeaLocation, nmeaUpdateInterval, mSendNmeaConsent);
 
     GnssNtripConnectionParams* pNtripParams = &(mStartDgnssNtripParams.ntripParams);
 
@@ -8989,7 +8936,6 @@ void GnssAdapter::readPPENtripConfig() {
         {"Ntrip_Params", &NtripParamsString, nullptr, 's'}
     };
     UTIL_READ_CONF(LOC_PATH_GPS_CONF, gpsConfParamTable);
-    LOC_LOGd("Ntrip_Params=%s", NtripParamsString);
 
     if (0 == strlen(NtripParamsString)) {
         return;
@@ -9000,8 +8946,7 @@ void GnssAdapter::readPPENtripConfig() {
     string next(NtripParamsString);
     stringstream ss(next);
 
-#define GET_NEXT() getline(ss, next, ' '); \
-        LOC_LOGd("%s", next.c_str());
+#define GET_NEXT() getline(ss, next, ' ');
 
     GET_NEXT();
     pNtripParams->hostNameOrIp = std::move(next);
@@ -9022,12 +8967,6 @@ void GnssAdapter::readPPENtripConfig() {
     GET_NEXT();
     pNtripParams->nmeaUpdateInterval = std::stoi(next) ? std::stoi(next) :
             DGNSS_RANGE_UPDATE_TIME_10MIN_IN_SEC;
-
-    LOC_LOGd("%d %s %d %s %s %s %d %d",
-             pNtripParams->useSSL, pNtripParams->hostNameOrIp.data(), pNtripParams->port,
-             pNtripParams->mountPoint.data(), pNtripParams->username.data(),
-             pNtripParams->password.data(), pNtripParams->requiresNmeaLocation,
-             pNtripParams->nmeaUpdateInterval);
 
     /* set up state*/
     mDgnssState |= DGNSS_STATE_ENABLE_NTRIP_COMMAND;
